@@ -1,0 +1,185 @@
+Terraform is an IAC tool that is used to deploy/provision any cloud platform.
+For example if it's Azure, the cloud platform then for docker containers ACS is the one on which we have to deploy the docker containers.
+Here, I will create the following files in my workspace that I will use to deploy to Azure cloud.
+I create a basic containerized app service.
+
+Workspace Name: AppServiceDeployement
+
+_backend.tf
+_local.tf
+_variables.tf
+resource_groups.tf
+acr.tf
+app_service.tf
+
+1) Log into your Azure account in the CLI with az login , then create the Service Principal with the following command, using the Subscription ID of the Subscription in your account you want to create the resources in.
+
+az ad sp create-for-rbac --role="Owner" --scopes="/subscriptions/[SUB ID]"
+
+2) Creating _backend.tf file.
+
+terraform {
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "=2.90.0"
+    }
+  }
+}
+provider "azurerm" {
+  features {}
+}
+
+3) Creating _local.tf file.
+
+locals {
+  tags_common = merge(var.tags_extra, {
+    Project     = var.project
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  })
+  name_prefix = "${var.project}-${var.environment}"
+  env = {
+    default = {
+      location          = "australiasoutheast"
+      backend_image     = "backend"
+      backend_image_tag = "1.0.0"
+      backend_port      = 3000
+      backend_domain    = "${var.environment}.${var.project}.com"
+    }
+    dev = {
+    }
+    qa = {
+    }
+    prod = {
+      backend_domain = "${var.project}.com"
+    }
+  }
+  workspace       = contains(keys(local.env), var.environment) ? var.environment : "default"
+  environmentvars = merge(local.env["default"], local.env[local.workspace])
+}
+
+3) Creating _variables.tf file.
+
+variable "region" {
+  description = "Azure region to create infrastructure in"
+  default     = "East-US"
+}
+variable "project" {
+  description = "The project name"
+  default     = "example"
+}
+variable "environment" {
+  description = "The project environment"
+  default     = "dev"
+}
+variable "tags_extra" {
+  type        = map(string)
+  description = "Extra tags that should be applied to all resources"
+  default     = {}
+}
+
+variable "ARM_CLIENT_ID" {}
+
+variable "ARM_CLIENT_SECRET" {}
+
+variable "ARM_SUBSCRIPTION_ID" {}
+
+variable "ARM_TENANT_ID" {}
+
+4) Creating resource_groups.tf file.
+
+Two resource group will be created for this example, the first to house the ACR and the second for all the App Service resources for the backend service.
+
+resource "azurerm_resource_group" "hub" {
+  name     = "${local.name_prefix}-hub"
+  location = local.environmentvars["location"]
+}
+
+resource "azurerm_resource_group" "backend-app" {
+  name     = "${local.name_prefix}-backend"
+  location = local.environmentvars["location"]
+}
+
+5) Creating acr.tf file.
+
+This file defines our Azure Container Registry resource. This only needs to be created once, not per environment, so a count has been used so that it is only created in the dev environment.  This ACR is created in the hub resource group, separate from the backend resource group as in the future, we may want to use this ACR for other services that are also in their own resource groups.
+
+resource "azurerm_container_registry" "registry" {
+  count = var.environment == "dev" ? 1 : 0
+
+  name                = "${var.project}registry" # Must be alphanumeric
+  resource_group_name = azurerm_resource_group.hub.name
+  location            = azurerm_resource_group.hub.location
+  sku                 = "Standard"
+  admin_enabled       = true # required for App Service
+}
+
+6) Creating app_service.tf file.
+
+This file defines an Azure App Service Plan and App Service, as well as all the resources to add a custom domain name and permissions to pull images from the ACR.
+
+resource "azurerm_app_service_plan" "backend" {
+  name                = "${local.name_prefix}-backend-appserviceplan"
+  location            = azurerm_resource_group.backend-app.location
+  resource_group_name = azurerm_resource_group.backend-app.name
+  kind                = "Linux"
+  reserved            = true # required for Linux plans, might need to be in a properties thing
+  sku {
+    tier = "Standard"
+    size = "S1"
+  }
+}
+resource "azurerm_app_service" "backend" {
+  name                = "${local.name_prefix}-backend-app-service"
+  location            = azurerm_resource_group.backend-app.location
+  resource_group_name = azurerm_resource_group.backend-app.name
+  app_service_plan_id = azurerm_app_service_plan.backend.id
+  app_settings = {
+    DOCKER_REGISTRY_SERVER_URL          = azurerm_container_registry.registry.0.login_server
+    DOCKER_REGISTRY_SERVER_USERNAME     = azurerm_container_registry.registry.0.admin_username
+    DOCKER_REGISTRY_SERVER_PASSWORD     = azurerm_container_registry.registry.0.admin_password
+    WEBSITES_ENABLE_APP_SERVICE_STORAGE = false
+    WEBSITES_PORT                       = local.environmentvars["backend_port"]
+  }
+
+  site_config {
+    always_on = "true"
+    # define the images to used for you application
+    linux_fx_version = "DOCKER|${azurerm_container_registry.registry.0.login_server}/${local.environmentvars["backend_image"]}:${local.environmentvars["backend_image_tag"]}"
+  }
+
+  identity {
+    type = "SystemAssigned"
+  }
+}
+
+resource "azurerm_app_service_custom_hostname_binding" "backend" {
+  hostname            = local.environmentvars["backend_domain"]
+  app_service_name    = azurerm_app_service.backend.name
+  resource_group_name = azurerm_resource_group.backend-app.name
+
+  lifecycle {
+    ignore_changes = [ssl_state, thumbprint]
+  }
+}
+
+resource "azurerm_app_service_managed_certificate" "backend" {
+  custom_hostname_binding_id = azurerm_app_service_custom_hostname_binding.backend.id
+}
+
+resource "azurerm_app_service_certificate_binding" "backend" {
+  hostname_binding_id = azurerm_app_service_custom_hostname_binding.backend.id
+  certificate_id      = azurerm_app_service_managed_certificate.backend.id
+  ssl_state           = "SniEnabled"
+}
+
+resource "azurerm_role_assignment" "acr_pull" {
+  principal_id                     = azurerm_app_service.backend.identity.0.principal_id
+  role_definition_name             = "AcrPull"
+  scope                            = azurerm_container_registry.registry.0.id
+  skip_service_principal_aad_check = true
+}
+
+Run terraform init and then terraform apply to create the resources.
+
